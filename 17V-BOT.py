@@ -1,34 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quotex Signal Bot v26 — Yahoo + curl_cffi Only (No API Keys)
-- Yahoo bypass via curl_cffi Chrome TLS fingerprint
-- No Stooq, no API key required
-- Multi-TF (1m+5m+15m) analysis, 15+ strategies
-- /test shows ALL markets with real failure reasons
-- /users = STATS + FULL MEMBER LIST
-- bot.py + users.txt only
+Quotex Signal Bot v32 — v26 Logic + API Storage
+- 100% original v26 signal logic (unchanged)
+- users.txt → API (afridi.bro.bd/vps/api.php)
+- Yahoo + curl_cffi
 """
 
 import subprocess
 import sys
 import importlib.util
 
-# 检查 curl_cffi 是否已安装
 if importlib.util.find_spec("curl_cffi") is None:
-    print("[*] curl_cffi 未安装，正在自动安装...")
+    print("[*] Installing curl_cffi...")
     try:
-        # 调用当前 Python 环境的 pip 进行安装
         subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi"])
-        print("[+] curl_cffi 安装成功")
+        print("[+] curl_cffi installed")
     except subprocess.CalledProcessError as e:
-        print(f"[!] 自动安装失败，请手动运行: pip install curl_cffi")
-        print(f"    错误信息: {e}")
-        sys.exit(1)  # 安装失败则退出，避免后续代码报错
+        print(f"[!] Install fail: {e}")
+        sys.exit(1)
 
-import sys, os, json, time, math, random, threading
-import urllib.parse, ssl
-from pathlib import Path
+import sys, os, json, time, math, random, threading, traceback
+import urllib.parse, urllib.request, ssl
 from datetime import datetime
 
 def log(msg, level="info"):
@@ -41,8 +34,12 @@ if sys.version_info < (3, 8):
 # ============================================================
 #   CONFIG
 # ============================================================
-BOT_TOKEN = "8733882861:AAEpvcBAxJWtnfHWBTju8mOZCaNBTTtw4i8"
+BOT_TOKEN = "8733882861:AAFQe4yRuSOvlFq25BhiYvGIXIosg2KyX_4"
 _OWNER = 6919881622
+
+API_URL    = "https://afridi.bro.bd/vps/api.php"
+API_SECRET = "afridi_bot_2024_xK9mP3nQ7vR2wL8z"
+API_TIMEOUT = 15
 
 SYMBOLS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
@@ -53,27 +50,26 @@ SYMBOLS = [
 YF_MAP = {s: s + "=X" for s in SYMBOLS}
 
 SCAN_INTERVAL     = 300
-MIN_CONFIDENCE    = 65
+MIN_CONFIDENCE    = 80
 COUNTDOWN_SECONDS = 5
 DEDUP_SECONDS     = 300
 CACHE_TTL         = 30
 MAX_CACHE         = 30
 
-USERS_FILE = Path("users.txt")
-AUTO_FLAG  = Path("auto.flag")
+AUTO_FLAG = "auto.flag"
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode    = ssl.CERT_NONE
 
 _CANDLE_CACHE    = {}
 _LAST_SIGNAL_MEM = {}
 _SIGNAL_STATS    = {"CALL": 0, "PUT": 0, "NO_TRADE": 0}
+_USER_CACHE      = {}
+_USER_CACHE_TTL  = 5
 
 # ============================================================
-#   HTTP — curl_cffi দিয়ে Yahoo বাইপাস (কোনো API Key নেই)
+#   HTTP — Yahoo via curl_cffi (v26 original)
 # ============================================================
 try:
     from curl_cffi import requests as cffi_requests
@@ -97,7 +93,6 @@ def http_get(url, params=None, timeout=12):
         except Exception:
             return None
     else:
-        # Fallback urllib (likely blocked by Yahoo)
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -109,6 +104,7 @@ def http_get(url, params=None, timeout=12):
             return None
 
 def http_post(url, data, timeout=10):
+    """Telegram API — JSON body"""
     try:
         body = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers={
@@ -118,8 +114,128 @@ def http_post(url, data, timeout=10):
     except Exception:
         return None
 
+def http_post_form(url, data, timeout=15):
+    """PHP API — form-urlencoded"""
+    try:
+        body = urllib.parse.urlencode(data).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[!] API POST fail: {str(e)[:80]}", flush=True)
+        return None
+
 # ============================================================
-#   YAHOO DATA FETCH (only source)
+#   API CLIENT
+# ============================================================
+def api_get(action, params=None):
+    p = dict(params or {}); p["action"] = action; p["key"] = API_SECRET
+    return http_get(API_URL, p, timeout=API_TIMEOUT)
+
+def api_post(action, data):
+    p = dict(data or {}); p["action"] = action; p["key"] = API_SECRET
+    return http_post_form(API_URL, p, timeout=API_TIMEOUT)
+
+def api_get_user(uid):
+    now = time.time()
+    if uid in _USER_CACHE:
+        u, ts = _USER_CACHE[uid]
+        if now - ts < _USER_CACHE_TTL:
+            return u
+    r = http_get(API_URL, {"id": str(uid)}, timeout=API_TIMEOUT)
+    if not r or not r.get("ok") or not r.get("exists"):
+        return None
+    u = r["user"]
+    _USER_CACHE[uid] = (u, now)
+    return u
+
+# ============================================================
+#   USERS — API backed (v26 interface preserved)
+# ============================================================
+def _ensure_users_file():
+    pass  # API-তে auto-create হয়
+
+def load_users():
+    r = api_get("list")
+    if not r or not r.get("ok"):
+        return {}
+    out = {}
+    for u in r.get("users", []):
+        out[str(u["id"])] = u
+    return out
+
+def save_users(users):
+    pass  # API auto-save করে
+
+def _is_owner(uid):
+    try: return int(uid) == int(_OWNER)
+    except Exception: return False
+
+def get_role(uid):
+    if _is_owner(uid): return "owner"
+    u = api_get_user(str(uid))
+    if not u: return "normal"
+    if not u.get("active", True): return "banned"
+    r = u.get("role", "normal")
+    if r == "vip": return "vip"
+    if r == "pending": return "pending"
+    return "normal"
+
+def register(uid, name="", username="", chat_id=None):
+    api_post("register", {
+        "id": str(uid), "name": name, "username": username,
+        "chat_id": str(chat_id or uid)
+    })
+    _USER_CACHE.pop(str(uid), None)
+
+def set_pending(uid, name="", username=""):
+    api_post("register", {
+        "id": str(uid), "name": name, "username": username,
+        "chat_id": str(uid)
+    })
+    api_post("set_role", {
+        "id": str(uid), "role": "pending",
+        "name": name, "username": username
+    })
+    _USER_CACHE.pop(str(uid), None)
+
+def approve(uid, name="", username="", chat_id=None):
+    info = api_get_user(str(uid)) or {}
+    api_post("set_role", {
+        "id": str(uid), "role": "vip",
+        "name": name or info.get("name", ""),
+        "username": username or info.get("username", ""),
+        "chat_id": str(chat_id or info.get("chat_id") or uid)
+    })
+    api_post("set_active", {"id": str(uid), "active": "1"})
+    _USER_CACHE.pop(str(uid), None)
+
+def revoke(uid):
+    api_post("set_role", {"id": str(uid), "role": "normal"})
+    _USER_CACHE.pop(str(uid), None)
+
+def ban(uid, state=True):
+    api_post("set_active", {"id": str(uid), "active": "0" if state else "1"})
+    _USER_CACHE.pop(str(uid), None)
+
+def inc_signals(uid):
+    api_post("inc_signals", {"id": str(uid)})
+
+def all_users():
+    return load_users()
+
+def approved_users():
+    return [u for u in load_users().values()
+            if u.get("role") == "vip" and u.get("active", True)]
+
+def pending_users():
+    return {k: v for k, v in load_users().items()
+            if v.get("role") == "pending" and v.get("active", True)}
+
+# ============================================================
+#   YAHOO DATA FETCH (v26 original)
 # ============================================================
 def fetch_yahoo(symbol, interval="1m", limit=100, debug=False):
     yf = YF_MAP.get(symbol)
@@ -196,7 +312,7 @@ def fetch_candles(symbol, interval="1m", limit=100, debug=False):
     return result
 
 # ============================================================
-#   MATH
+#   MATH (v26 original)
 # ============================================================
 def mean(a): return sum(a)/len(a) if a else 0.0
 def std(a):
@@ -270,7 +386,7 @@ def macd_hist(closes):
     return m_now, m_now - m_prev
 
 # ============================================================
-#   PATTERNS
+#   PATTERNS (v26 original)
 # ============================================================
 def bull_engulf(a, b):
     return (a["close"]>a["open"] and b["close"]<b["open"]
@@ -306,7 +422,7 @@ def shooting_star(c):
     return upper > rng*0.6 and lower < rng*0.15 and body > 0
 
 # ============================================================
-#   FILTERS
+#   FILTERS (v26 original)
 # ============================================================
 def fib_levels(candles):
     recent = candles[-30:]
@@ -376,7 +492,7 @@ def trend_direction(candles):
     return "FLAT"
 
 # ============================================================
-#   SINGLE-TF ANALYSIS
+#   SINGLE-TF ANALYSIS (v26 original)
 # ============================================================
 def analyze_tf(candles, weight=1.0):
     if not candles or len(candles) < 40:
@@ -471,93 +587,97 @@ def analyze_tf(candles, weight=1.0):
             "sig": sig, "det": det, "valid": True}
 
 # ============================================================
-#   MULTI-TF ANALYSIS
+#   MULTI-TF ANALYSIS (v26 original + safety wrapper)
 # ============================================================
 def analyze(symbol):
-    c1 = fetch_candles(symbol, "1m", 100)
-    c5 = fetch_candles(symbol, "5m", 100)
-    c15 = fetch_candles(symbol, "15m", 100)
+    try:
+        c1 = fetch_candles(symbol, "1m", 100)
+        c5 = fetch_candles(symbol, "5m", 100)
+        c15 = fetch_candles(symbol, "15m", 100)
 
-    if not c1 or len(c1) < 40:
-        return None
+        if not c1 or len(c1) < 40:
+            return None
 
-    live = fetch_live_price(symbol)
-    price = live if live else c1[-1]["close"]
+        live = fetch_live_price(symbol)
+        price = live if live else c1[-1]["close"]
 
-    r1 = analyze_tf(c1, 1.0)
-    r5 = analyze_tf(c5, 1.3) if c5 and len(c5) >= 40 else None
-    r15 = analyze_tf(c15, 1.6) if c15 and len(c15) >= 40 else None
+        r1 = analyze_tf(c1, 1.0)
+        r5 = analyze_tf(c5, 1.3) if c5 and len(c5) >= 40 else None
+        r15 = analyze_tf(c15, 1.6) if c15 and len(c15) >= 40 else None
 
-    total_call = r1["call"]; total_put = r1["put"]
-    tf_votes = []; all_sigs = list(r1["sig"])
+        total_call = r1["call"]; total_put = r1["put"]
+        tf_votes = []; all_sigs = list(r1["sig"])
 
-    if r1["valid"]:
-        if r1["call"] > r1["put"]+5: tf_votes.append(("CALL","1m"))
-        elif r1["put"] > r1["call"]+5: tf_votes.append(("PUT","1m"))
-    if r5:
-        total_call += r5["call"]; total_put += r5["put"]; all_sigs.extend(r5["sig"])
-        if r5["valid"]:
-            if r5["call"] > r5["put"]+5: tf_votes.append(("CALL","5m"))
-            elif r5["put"] > r5["call"]+5: tf_votes.append(("PUT","5m"))
-    if r15:
-        total_call += r15["call"]; total_put += r15["put"]; all_sigs.extend(r15["sig"])
-        if r15["valid"]:
-            if r15["call"] > r15["put"]+5: tf_votes.append(("CALL","15m"))
-            elif r15["put"] > r15["call"]+5: tf_votes.append(("PUT","15m"))
+        if r1["valid"]:
+            if r1["call"] > r1["put"]+5: tf_votes.append(("CALL","1m"))
+            elif r1["put"] > r1["call"]+5: tf_votes.append(("PUT","1m"))
+        if r5:
+            total_call += r5["call"]; total_put += r5["put"]; all_sigs.extend(r5["sig"])
+            if r5["valid"]:
+                if r5["call"] > r5["put"]+5: tf_votes.append(("CALL","5m"))
+                elif r5["put"] > r5["call"]+5: tf_votes.append(("PUT","5m"))
+        if r15:
+            total_call += r15["call"]; total_put += r15["put"]; all_sigs.extend(r15["sig"])
+            if r15["valid"]:
+                if r15["call"] > r15["put"]+5: tf_votes.append(("CALL","15m"))
+                elif r15["put"] > r15["call"]+5: tf_votes.append(("PUT","15m"))
 
-    call_votes = sum(1 for d,_ in tf_votes if d=="CALL")
-    put_votes = sum(1 for d,_ in tf_votes if d=="PUT")
+        call_votes = sum(1 for d,_ in tf_votes if d=="CALL")
+        put_votes = sum(1 for d,_ in tf_votes if d=="PUT")
 
-    if call_votes >= 2 and call_votes > put_votes: direction = "CALL"
-    elif put_votes >= 2 and put_votes > call_votes: direction = "PUT"
-    elif total_call > total_put+15 and call_votes >= put_votes: direction = "CALL"
-    elif total_put > total_call+15 and put_votes >= call_votes: direction = "PUT"
-    else:
-        _SIGNAL_STATS["NO_TRADE"] = _SIGNAL_STATS.get("NO_TRADE",0)+1
-        return {"direction":"NO_TRADE","confidence":0,
-                "signals":["Multi-TF disagree","Sideway or weak trend"],
-                "price":price,"duration":"—","dur_reason":"No clear setup",
+        if call_votes >= 2 and call_votes > put_votes: direction = "CALL"
+        elif put_votes >= 2 and put_votes > call_votes: direction = "PUT"
+        elif total_call > total_put+15 and call_votes >= put_votes: direction = "CALL"
+        elif total_put > total_call+15 and put_votes >= call_votes: direction = "PUT"
+        else:
+            _SIGNAL_STATS["NO_TRADE"] = _SIGNAL_STATS.get("NO_TRADE",0)+1
+            return {"direction":"NO_TRADE","confidence":0,
+                    "signals":["Multi-TF disagree","Sideway or weak trend"],
+                    "price":price,"duration":"—","dur_reason":"No clear setup",
+                    "details":{"1m":r1["det"],"5m":r5["det"] if r5 else {},"15m":r15["det"] if r15 else {}},
+                    "atr":atr(c1,14),"symbol":symbol,"quality":"—",
+                    "tf_votes":f"C{call_votes}/P{put_votes}"}
+
+        total = total_call+total_put
+        if total == 0: return None
+        winner = total_call if direction=="CALL" else total_put
+
+        ratio_factor = winner/total
+        tf_factor = max(call_votes,put_votes)/max(len(tf_votes),1)
+        max_adx = max(r1["det"].get("adx",0),
+                      r5["det"].get("adx",0) if r5 else 0,
+                      r15["det"].get("adx",0) if r15 else 0)
+        adx_factor = min(max_adx/50.0,1.0)
+        div_found = any("div" in s.lower() for s in all_sigs)
+        div_factor = 1.0 if div_found else 0.5
+
+        score = (ratio_factor*0.40 + tf_factor*0.30 + adx_factor*0.20 + div_factor*0.10)*100
+        conf = int(60+(score-50)*0.7) if score > 50 else 55
+        conf = max(55,min(95,conf))
+
+        if conf >= 85: quality = "★★★ HIGH"
+        elif conf >= 75: quality = "★★★ GOOD"
+        elif conf >= 65: quality = "★★ FAIR"
+        else: quality = "★ WEAK"
+
+        atr_val = atr(c1,14)
+        if conf >= 85 and max_adx >= 28: dur,dur_r = "5 minutes","Strong trend"
+        elif conf >= 78: dur,dur_r = "3 minutes","Good setup"
+        elif conf >= 70: dur,dur_r = "2 minutes","Balanced"
+        else: dur,dur_r = "1 minute","Quick scalp"
+
+        sig_list = list(dict.fromkeys(all_sigs))[:10]
+        _SIGNAL_STATS[direction] = _SIGNAL_STATS.get(direction,0)+1
+
+        return {"direction":direction,"confidence":conf,"signals":sig_list,
+                "price":price,"duration":dur,"dur_reason":dur_r,
                 "details":{"1m":r1["det"],"5m":r5["det"] if r5 else {},"15m":r15["det"] if r15 else {}},
-                "atr":atr(c1,14),"symbol":symbol,"quality":"—",
+                "atr":atr_val,"symbol":symbol,"quality":quality,
                 "tf_votes":f"C{call_votes}/P{put_votes}"}
-
-    total = total_call+total_put
-    if total == 0: return None
-    winner = total_call if direction=="CALL" else total_put
-    loser = total_put if direction=="CALL" else total_call
-
-    ratio_factor = winner/total
-    tf_factor = max(call_votes,put_votes)/max(len(tf_votes),1)
-    max_adx = max(r1["det"].get("adx",0),
-                  r5["det"].get("adx",0) if r5 else 0,
-                  r15["det"].get("adx",0) if r15 else 0)
-    adx_factor = min(max_adx/50.0,1.0)
-    div_found = any("div" in s.lower() for s in all_sigs)
-    div_factor = 1.0 if div_found else 0.5
-
-    score = (ratio_factor*0.40 + tf_factor*0.30 + adx_factor*0.20 + div_factor*0.10)*100
-    conf = int(60+(score-50)*0.7) if score > 50 else 55
-    conf = max(55,min(95,conf))
-
-    if conf >= 85: quality = "★★★ HIGH"
-    elif conf >= 75: quality = "★★★ GOOD"
-    elif conf >= 65: quality = "★★ FAIR"
-    else: quality = "★ WEAK"
-
-    atr_val = atr(c1,14)
-    if conf >= 85 and max_adx >= 28: dur,dur_r = "5 minutes","Strong trend"
-    elif conf >= 78: dur,dur_r = "3 minutes","Good setup"
-    elif conf >= 70: dur,dur_r = "2 minutes","Balanced"
-    else: dur,dur_r = "1 minute","Quick scalp"
-
-    sig_list = list(dict.fromkeys(all_sigs))[:10]
-    _SIGNAL_STATS[direction] = _SIGNAL_STATS.get(direction,0)+1
-
-    return {"direction":direction,"confidence":conf,"signals":sig_list,
-            "price":price,"duration":dur,"dur_reason":dur_r,
-            "details":{"1m":r1["det"],"5m":r5["det"] if r5 else {},"15m":r15["det"] if r15 else {}},
-            "atr":atr_val,"symbol":symbol,"quality":quality,
-            "tf_votes":f"C{call_votes}/P{put_votes}"}
+    except Exception as e:
+        print(f"[!] analyze({symbol}) crash: {e}", flush=True)
+        traceback.print_exc()
+        return None
 
 def scan_auto():
     pool = SYMBOLS.copy(); random.shuffle(pool)
@@ -583,130 +703,17 @@ def mark_signal(sig):
     _LAST_SIGNAL_MEM[sig["symbol"]] = {"direction":sig["direction"],"time":time.time()}
 
 # ============================================================
-#   USERS
-# ============================================================
-def _ensure_users_file():
-    if not USERS_FILE.exists():
-        USERS_FILE.write_text(
-            "# chat_id|username|name|role|active|signals|joined\n"
-            f"{_OWNER}|@owner|Owner|owner|1|0|{int(time.time())}\n",
-            encoding="utf-8")
-
-def load_users():
-    _ensure_users_file()
-    users = {}
-    try:
-        for line in USERS_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"): continue
-            parts = line.split("|")
-            if len(parts) < 4: continue
-            try:
-                cid = int(parts[0])
-                uname = parts[1].strip()
-                name = parts[2].strip()
-                role = parts[3].strip() or "normal"
-                act = int(parts[4]) if len(parts)>4 and parts[4].strip() else 1
-                sig_n = int(parts[5]) if len(parts)>5 and parts[5].strip() else 0
-                join = int(parts[6]) if len(parts)>6 and parts[6].strip() else int(time.time())
-            except Exception: continue
-            users[str(cid)] = {"id":cid,"chat_id":cid,
-                "username":uname.lstrip("@") if uname not in ("","—") else "",
-                "name":name,"role":role,"active":bool(act),
-                "signals":sig_n,"joined":join}
-    except Exception: pass
-    return users
-
-def save_users(users):
-    lines = ["# chat_id|username|name|role|active|signals|joined"]
-    for u in users.values():
-        uname = ("@"+u.get("username","")) if u.get("username") else "—"
-        lines.append(f"{u['id']}|{uname}|{u.get('name','')}|{u.get('role','normal')}|"
-                     f"{1 if u.get('active',True) else 0}|{u.get('signals',0)}|{u.get('joined',0)}")
-    try: USERS_FILE.write_text("\n".join(lines)+"\n", encoding="utf-8")
-    except Exception: pass
-
-def _is_owner(uid):
-    try: return int(uid)==int(_OWNER)
-    except Exception: return False
-
-def get_role(uid):
-    if _is_owner(uid): return "owner"
-    u = load_users().get(str(uid),{})
-    if u.get("role")=="vip" and u.get("active",True): return "vip"
-    if not u.get("active",True) and u: return "banned"
-    if u.get("role")=="pending": return "pending"
-    return "normal"
-
-def register(uid,name="",username="",chat_id=None):
-    users = load_users(); k = str(uid); changed = False
-    if k not in users:
-        users[k] = {"id":int(uid),"chat_id":int(chat_id or uid),
-            "username":username or "","name":name or "",
-            "role":"owner" if _is_owner(uid) else "normal",
-            "active":True,"signals":0,"joined":int(time.time())}
-        changed = True
-    else:
-        u = users[k]
-        if name and u.get("name")!=name: u["name"]=name; changed=True
-        if username and u.get("username")!=username: u["username"]=username; changed=True
-        if chat_id and u.get("chat_id")!=int(chat_id): u["chat_id"]=int(chat_id); changed=True
-        if _is_owner(uid) and u.get("role")!="owner": u["role"]="owner"; changed=True
-    if changed: save_users(users)
-
-def set_pending(uid,name="",username=""):
-    users = load_users(); k = str(uid)
-    if k not in users:
-        users[k] = {"id":int(uid),"chat_id":int(uid),
-            "username":username or "","name":name or "",
-            "role":"pending","active":True,"signals":0,"joined":int(time.time())}
-    else:
-        if users[k].get("role")=="normal": users[k]["role"]="pending"
-        if name: users[k]["name"]=name
-        if username: users[k]["username"]=username
-    save_users(users)
-
-def approve(uid):
-    users = load_users(); k = str(uid)
-    if k not in users:
-        users[k] = {"id":int(uid),"chat_id":int(uid),"username":"","name":"",
-            "role":"vip","active":True,"signals":0,"joined":int(time.time())}
-    else:
-        users[k]["role"]="vip"; users[k]["active"]=True
-    save_users(users)
-
-def revoke(uid):
-    users = load_users(); k = str(uid)
-    if k in users: users[k]["role"]="normal"; save_users(users)
-
-def ban(uid,state=True):
-    users = load_users(); k = str(uid)
-    if k in users: users[k]["active"]=not state; save_users(users)
-
-def inc_signals(uid):
-    users = load_users(); k = str(uid)
-    if k in users: users[k]["signals"]=users[k].get("signals",0)+1; save_users(users)
-
-def all_users(): return load_users()
-def approved_users():
-    return [u for u in all_users().values() if u.get("role")=="vip" and u.get("active",True)]
-def pending_users():
-    return {k:v for k,v in all_users().items() if v.get("role")=="pending" and v.get("active",True)}
-
-# ============================================================
-#   REPORTS
+#   REPORTS (v26 logic but API data)
 # ============================================================
 def build_stats_report():
-    users = all_users(); total = len(users)
-    vip = sum(1 for u in users.values() if u.get("role")=="vip" and u.get("active",True))
-    owner_ = sum(1 for u in users.values() if u.get("role")=="owner")
-    banned = sum(1 for u in users.values() if not u.get("active",True))
-    pend = sum(1 for u in users.values() if u.get("role")=="pending" and u.get("active",True))
-    normal = sum(1 for u in users.values() if u.get("role")=="normal" and u.get("active",True))
+    r = api_get("stats")
+    s = r.get("stats", {}) if r and r.get("ok") else {}
     return ("📊 <b>BOT STATS</b>\n━━━━━━━━━━━━━━━━━━━\n"
-            f"👥 Total users : {total}\n⭐ VIP users   : {vip}\n"
-            f"🚫 Banned      : {banned}\n⏳ Pending     : {pend}\n"
-            f"👤 Normal      : {normal}\n👑 Owner       : {owner_}\n"
+            f"👥 Total users : {s.get('total',0)}\n⭐ VIP users   : {s.get('vip',0)}\n"
+            f"🚫 Banned      : {s.get('banned',0)}\n⏳ Pending     : {s.get('pending',0)}\n"
+            f"👤 Normal      : {s.get('normal',0)}\n👑 Owner       : {s.get('owner',0)}\n"
+            f"🏆 Wins/Losses : {s.get('wins',0)}/{s.get('losses',0)}\n"
+            f"📈 Win rate    : <b>{s.get('winrate',0)}%</b>\n"
             f"📞 CALL signals: {_SIGNAL_STATS.get('CALL',0)}\n"
             f"📉 PUT  signals: {_SIGNAL_STATS.get('PUT',0)}\n"
             f"🚫 No-trade    : {_SIGNAL_STATS.get('NO_TRADE',0)}\n"
@@ -714,46 +721,72 @@ def build_stats_report():
 
 def _fmt_full_member_list():
     users = all_users()
-    if not users: return "<b>📋 MEMBER LIST</b>\n(empty)"
+    if not users:
+        return "<b>📋 MEMBER LIST</b>\n(empty)"
     order = {"owner":0,"vip":1,"pending":2,"normal":3}
-    items = sorted(users.values(), key=lambda u: 9 if not u.get("active",True) else order.get(u.get("role","normal"),5))
-    W_NUM,W_USER,W_CHAT,W_NAME,W_ROLE = 3,22,13,16,10
-    total_w = W_NUM+W_USER+W_CHAT+W_NAME+W_ROLE+12
-    line = "─"*total_w; dline = "═"*total_w
-    def cell(s,w,al="<"):
-        s=str(s)[:w]
-        return s.ljust(w) if al=="<" else s.rjust(w)
-    out = ["📋 <b>FULL MEMBER LIST</b>", dline]
-    out.append(" # │ "+cell("@USERNAME",W_USER)+" │ "+cell("CHAT ID",W_CHAT,">")+" │ "+cell("NAME",W_NAME)+" │ "+cell("ROLE",W_ROLE)+" ")
-    out.append(line)
-    for i,u in enumerate(items,1):
-        cid = u.get("chat_id") or u.get("id","?")
-        uname = u.get("username") or ""
-        uf = f"@{uname}" if uname else "—"
-        role = u.get("role","normal"); act = u.get("active",True)
-        tag = "BANNED" if not act else ("👑 OWNER" if role=="owner" else ("⭐ VIP" if role=="vip" else ("⏳ PEND" if role=="pending" else "NORMAL")))
-        out.append(cell(str(i),W_NUM,">")+" │ "+cell(uf,W_USER)+" │ "+cell(str(cid),W_CHAT,">")+" │ "+cell(u.get("name","?") or "—",W_NAME)+" │ "+cell(tag,W_ROLE)+" ")
-    out.append(line); out.append(f"  Total: {len(items)}")
-    return "<code>"+"\n".join(out)+"</code>"
+    items = sorted(users.values(), key=lambda u: 9 if not u.get("active",True)
+                   else order.get(u.get("role","normal"),5))
+
+    W_NUM, W_USER, W_CHAT, W_NAME, W_ROLE = 2, 16, 12, 12, 9
+    sep_top = "┌" + "─"*(W_NUM+2) + "┬" + "─"*(W_USER+2) + "┬" \
+              + "─"*(W_CHAT+2) + "┬" + "─"*(W_NAME+2) + "┬" + "─"*(W_ROLE+2) + "┐"
+    sep_mid = "├" + "─"*(W_NUM+2) + "┼" + "─"*(W_USER+2) + "┼" \
+              + "─"*(W_CHAT+2) + "┼" + "─"*(W_NAME+2) + "┼" + "─"*(W_ROLE+2) + "┤"
+    sep_bot = "└" + "─"*(W_NUM+2) + "┴" + "─"*(W_USER+2) + "┴" \
+              + "─"*(W_CHAT+2) + "┴" + "─"*(W_NAME+2) + "┴" + "─"*(W_ROLE+2) + "┘"
+    def row(cols):
+        cells = []
+        for val, w in zip(cols, [W_NUM, W_USER, W_CHAT, W_NAME, W_ROLE]):
+            s = str(val)
+            if len(s) > w: s = s[:w-1] + "…"
+            cells.append(" " + s.ljust(w) + " ")
+        return "│" + "│".join(cells) + "│"
+
+    lines = ["<b>📋 FULL MEMBER LIST</b>", "", sep_top,
+             row(["#", "@USERNAME", "CHAT ID", "NAME", "ROLE"]), sep_mid]
+    for i, u in enumerate(items, 1):
+        cid = u.get("chat_id") or u.get("id", "?")
+        un = u.get("username") or ""
+        uf = f"@{un}" if un else "—"
+        role = u.get("role", "normal"); act = u.get("active", True)
+        if not act: tag = "BANNED"
+        elif role == "owner": tag = "OWNER"
+        elif role == "vip": tag = "VIP"
+        elif role == "pending": tag = "PENDING"
+        else: tag = "NORMAL"
+        lines.append(row([i, uf, cid, u.get("name") or "—", tag]))
+    lines.append(sep_bot)
+    lines.append("")
+    lines.append(f"Total: <b>{len(items)}</b>")
+    return "\n".join(lines)
 
 def _fmt_filtered(title, users_dict):
     if not users_dict: return f"<b>{title}</b>\n(empty)"
-    W_NUM,W_USER,W_CHAT,W_NAME,W_ROLE = 3,22,13,16,10
-    total_w = W_NUM+W_USER+W_CHAT+W_NAME+W_ROLE+12
-    line = "─"*total_w; dline = "═"*total_w
-    def cell(s,w,al="<"):
-        s=str(s)[:w]
-        return s.ljust(w) if al=="<" else s.rjust(w)
-    out = [f"📋 <b>{title}</b>", dline]
-    out.append(" # │ "+cell("@USERNAME",W_USER)+" │ "+cell("CHAT ID",W_CHAT,">")+" │ "+cell("NAME",W_NAME)+" │ "+cell("ROLE",W_ROLE)+" ")
-    out.append(line)
-    for i,(k,u) in enumerate(users_dict.items(),1):
+    W_NUM, W_USER, W_CHAT, W_NAME, W_ROLE = 2, 16, 12, 12, 9
+    sep_top = "┌" + "─"*(W_NUM+2) + "┬" + "─"*(W_USER+2) + "┬" \
+              + "─"*(W_CHAT+2) + "┬" + "─"*(W_NAME+2) + "┬" + "─"*(W_ROLE+2) + "┐"
+    sep_mid = "├" + "─"*(W_NUM+2) + "┼" + "─"*(W_USER+2) + "┼" \
+              + "─"*(W_CHAT+2) + "┼" + "─"*(W_NAME+2) + "┼" + "─"*(W_ROLE+2) + "┤"
+    sep_bot = "└" + "─"*(W_NUM+2) + "┴" + "─"*(W_USER+2) + "┴" \
+              + "─"*(W_CHAT+2) + "┴" + "─"*(W_NAME+2) + "┴" + "─"*(W_ROLE+2) + "┘"
+    def row(cols):
+        cells = []
+        for val, w in zip(cols, [W_NUM, W_USER, W_CHAT, W_NAME, W_ROLE]):
+            s = str(val)
+            if len(s) > w: s = s[:w-1] + "…"
+            cells.append(" " + s.ljust(w) + " ")
+        return "│" + "│".join(cells) + "│"
+    lines = [f"<b>📋 {title}</b>", "", sep_top,
+             row(["#", "@USERNAME", "CHAT ID", "NAME", "ROLE"]), sep_mid]
+    for i, (k, u) in enumerate(users_dict.items(), 1):
         cid = u.get("chat_id") or k
-        uname = u.get("username") or ""
-        uf = f"@{uname}" if uname else "—"
-        out.append(cell(str(i),W_NUM,">")+" │ "+cell(uf,W_USER)+" │ "+cell(str(cid),W_CHAT,">")+" │ "+cell(u.get("name","?") or "—",W_NAME)+" │ "+cell((u.get("role","?") or "?")[:W_ROLE],W_ROLE)+" ")
-    out.append(line); out.append(f"  Total: {len(users_dict)}")
-    return "<code>"+"\n".join(out)+"</code>"
+        un = u.get("username") or ""
+        uf = f"@{un}" if un else "—"
+        lines.append(row([i, uf, cid, u.get("name") or "—", (u.get("role","?") or "?").upper()[:9]]))
+    lines.append(sep_bot)
+    lines.append("")
+    lines.append(f"Total: <b>{len(users_dict)}</b>")
+    return "\n".join(lines)
 
 # ============================================================
 #   TELEGRAM
@@ -794,7 +827,7 @@ def build_owner_pending_keyboard(uid):
         {"text":"❌ Reject","callback_data":f"rej:{uid}"}]]}
 
 def build_start_text(name,role):
-    txt = ("<b>🤖 Quotex Signal Bot v26</b>\n━━━━━━━━━━━━━━━━━━━\n"
+    txt = ("<b>🤖 Quotex Signal Bot v32</b>\n━━━━━━━━━━━━━━━━━━━\n"
            f"👤 {name or 'User'}\n📊 {len(SYMBOLS)} markets\n"
            f"🧠 Multi-TF + 15+ strategies\n"
            f"🎯 {MIN_CONFIDENCE}%+ accuracy\n"
@@ -855,24 +888,17 @@ def send_signal_with_countdown(chat_id,sig):
 def notify_owner_new_user(uid,name="",username="",chat_id=None):
     try:
         chat_id = chat_id or uid
-        W_USER,W_CHAT,W_STAT = 22,13,11
-        total_w = 3+W_USER+W_CHAT+W_STAT+9
-        line = "─"*total_w; dline = "═"*total_w
-        def cl(s,w,al="<"):
-            s=str(s)[:w]; return s.ljust(w) if al=="<" else s.rjust(w)
-        uf = f"@{username}" if username else "—"
-        table = ["📊 NEW USER REQUEST",dline]
-        table.append(" # │ "+cl("@USERNAME",W_USER)+" │ "+cl("CHAT ID",W_CHAT,">")+" │ "+cl("STATUS",W_STAT)+" ")
-        table.append(line)
-        table.append(cl("1",3,">")+" │ "+cl(uf,W_USER)+" │ "+cl(str(chat_id),W_CHAT,">")+" │ "+cl("⏳ PENDING",W_STAT)+" ")
-        table.append(line); table.append("  Total: 1  |  ✓ 0  |  ✗ 1"); table.append(dline)
-        table.append(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        tg_send(_OWNER,"<code>"+"\n".join(table)+"</code>",
-                reply_markup=build_owner_pending_keyboard(uid))
+        uname = f"@{username}" if username else "—"
+        txt = ("📊 <b>NEW USER REQUEST</b>\n━━━━━━━━━━━━━━━━━━━\n"
+               f"🆔 <code>{chat_id}</code>\n"
+               f"📛 {uname}\n"
+               f"👤 {name or '—'}\n"
+               f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        tg_send(_OWNER, txt, reply_markup=build_owner_pending_keyboard(uid))
     except Exception: pass
 
 # ============================================================
-#   CALLBACK
+#   CALLBACK (v26 original)
 # ============================================================
 def handle_callback(cb):
     try:
@@ -887,35 +913,34 @@ def handle_callback(cb):
             if not _is_owner(user): tg_answer(cb_id,"Only owner"); return
             try: target = int(data.split(":",1)[1])
             except Exception: tg_answer(cb_id,"Invalid"); return
-            tinfo = load_users().get(str(target),{})
-            tuname = tinfo.get("username",""); tchat = tinfo.get("chat_id",target)
-            uf = f"@{tuname}" if tuname else "—"
-            W_USER,W_CHAT,W_STAT = 22,13,11
-            total_w = 3+W_USER+W_CHAT+W_STAT+9
-            line = "─"*total_w; dline = "═"*total_w
-            def cl(s,w,al="<"):
-                s=str(s)[:w]; return s.ljust(w) if al=="<" else s.rjust(w)
+
+            info = api_get_user(str(target)) or {}
+            tname = info.get("name","")
+            tuname = info.get("username","")
+            tchat = info.get("chat_id", target)
+
             if data.startswith("apr:"):
-                approve(target); tag="✓ APPROVED"
-                try: tg_edit(chat,msg_id,"<code>"+"\n".join([
-                    "📊 APPROVAL RESULT",dline,
-                    " # │ "+cl("@USERNAME",W_USER)+" │ "+cl("CHAT ID",W_CHAT,">")+" │ "+cl("STATUS",W_STAT)+" ",
-                    line," 1 │ "+cl(uf,W_USER)+" │ "+cl(str(tchat),W_CHAT,">")+" │ "+cl(tag,W_STAT)+" ",
-                    line,"  Total: 1  |  ✓ 1  |  ✗ 0"])+"</code>")
-                except Exception: pass
+                approve(target, tname, tuname, tchat)
                 tg_answer(cb_id,"Approved")
                 try: tg_send(target,"🎉 <b>You're approved!</b>\nTry /start now.")
                 except Exception: pass
-            else:
-                ban(target,True); tag="✗ REJECTED"
-                try: tg_edit(chat,msg_id,"<code>"+"\n".join([
-                    "📊 APPROVAL RESULT",dline,
-                    " # │ "+cl("@USERNAME",W_USER)+" │ "+cl("CHAT ID",W_CHAT,">")+" │ "+cl("STATUS",W_STAT)+" ",
-                    line," 1 │ "+cl(uf,W_USER)+" │ "+cl(str(tchat),W_CHAT,">")+" │ "+cl(tag,W_STAT)+" ",
-                    line,"  Total: 1  |  ✓ 0  |  ✗ 1"])+"</code>")
+                try:
+                    tg_edit(chat, msg_id,
+                        f"✅ <b>APPROVED</b>\n\n"
+                        f"🆔 <code>{target}</code>\n"
+                        f"📛 @{tuname or '—'}\n"
+                        f"👤 {tname or '—'}")
                 except Exception: pass
-                tg_answer(cb_id,"Rejected")
+            else:
+                ban(target,True); tg_answer(cb_id,"Rejected")
                 try: tg_send(target,"❌ Access denied by admin.")
+                except Exception: pass
+                try:
+                    tg_edit(chat, msg_id,
+                        f"❌ <b>REJECTED</b>\n\n"
+                        f"🆔 <code>{target}</code>\n"
+                        f"📛 @{tuname or '—'}\n"
+                        f"👤 {tname or '—'}")
                 except Exception: pass
             return
 
@@ -954,9 +979,10 @@ def handle_callback(cb):
         tg_send(chat,"🔄 <b>Pick another market:</b>",reply_markup=build_market_keyboard())
     except Exception as e:
         print(f"[!] Callback: {e}",flush=True)
+        traceback.print_exc()
 
 # ============================================================
-#   HANDLE
+#   HANDLE (v26 original)
 # ============================================================
 def handle(msg):
     try:
@@ -970,7 +996,7 @@ def handle(msg):
 
         if role == "banned": tg_send(chat,"🚫 Access denied."); return
         if role == "normal" and not _is_owner(user):
-            u = load_users().get(str(user),{})
+            u = api_get_user(str(user)) or {}
             if u.get("role")!="pending":
                 set_pending(user,name,username); notify_owner_new_user(user,name,username,chat)
             tg_send(chat,"⏳ <b>PENDING APPROVAL</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1002,10 +1028,9 @@ def handle(msg):
             else: tg_send(chat,"⚠️ No high-quality setup.\nWait for better conditions.")
             return
 
-        # ============ /test — ALL MARKETS ============
         if text.startswith("/test"):
             total = len(SYMBOLS)
-            dep = "✅ curl_cffi" if HAS_CFFI else "❌ curl_cffi MISSING (pip install curl_cffi)"
+            dep = "✅ curl_cffi" if HAS_CFFI else "❌ curl_cffi MISSING"
             prog = tg_send(chat,
                 f"🧪 <b>Testing all {total} markets...</b>\n{dep}\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
@@ -1029,25 +1054,13 @@ def handle(msg):
                         f"<code>{bar}</code>\n{pct}% ({idx}/{total})")
                     except Exception: pass
 
-            W_NUM,W_SYM,W_CNT,W_STAT,W_REASON = 3,10,7,10,18
-            total_w = W_NUM+W_SYM+W_CNT+W_STAT+W_REASON+12
-            line = "─"*total_w; dline = "═"*total_w
-            def cell(s,w,al="<"):
-                s=str(s)[:w]; return s.ljust(w) if al=="<" else s.rjust(w)
-            out = ["🧪 <b>DATA SOURCE TEST</b>",dline]
-            out.append(" # │ "+cell("MARKET",W_SYM)+" │ "+cell("CANDLES",W_CNT,">")+" │ "+cell("STATUS",W_STAT)+" │ "+cell("REASON",W_REASON)+" ")
-            out.append(line)
+            out = ["🧪 <b>DATA SOURCE TEST</b>", ""]
             for i,(s,cnt,ok,reason) in enumerate(results,1):
-                status = "✅ OK" if ok else "❌ FAIL"
-                out.append(cell(str(i),W_NUM,">")+" │ "+cell(s,W_SYM)+" │ "+cell(str(cnt),W_CNT,">")+" │ "+cell(status,W_STAT)+" │ "+cell(reason,W_REASON)+" ")
-            out.append(line); fail_count = total-ok_count
-            out.append(f"  Total: {total}  |  ✓ {ok_count}  |  ✗ {fail_count}")
-            if ok_count==0:
-                out.append(""); out.append("💡 <b>Fix:</b>")
-                if not HAS_CFFI: out.append("• <code>pip install curl_cffi</code>")
-                else: out.append("• Yahoo may rate-limit your IP, wait 5 min")
-                out.append("• Or run on different network")
-            final = "<code>"+"\n".join(out)+"</code>"
+                status = "✅" if ok else "❌"
+                out.append(f"{status} <b>{s}</b> — {cnt} ({reason})")
+            out.append("")
+            out.append(f"Total: <b>{total}</b> | ✓ {ok_count} | ✗ {total-ok_count}")
+            final = "\n".join(out)
             if msg_id:
                 try: tg_edit(chat,msg_id,final)
                 except Exception: tg_send(chat,final)
@@ -1056,16 +1069,18 @@ def handle(msg):
 
         if text.startswith("/autostart"):
             if role not in ("vip","owner"): tg_send(chat,"🔒 VIP only"); return
-            AUTO_FLAG.write_text(str(int(time.time())))
+            open(AUTO_FLAG,"w").write(str(int(time.time())))
             tg_send(chat,f"▶️ Auto ({SCAN_INTERVAL//60} min)"); return
         if text.startswith("/stop"):
             if role not in ("vip","owner"): return
-            try: AUTO_FLAG.unlink()
+            try: os.remove(AUTO_FLAG)
             except Exception: pass
             tg_send(chat,"⏹ Stopped"); return
+
         if text.startswith("/stats"):
             if role != "owner": tg_send(chat,"🔒 <b>Owner only</b>"); return
             tg_send(chat,build_stats_report()); return
+
         if text.startswith("/users"):
             if role != "owner": tg_send(chat,"🔒 <b>Owner only</b>"); return
             tg_send(chat,build_stats_report()); time.sleep(0.3)
@@ -1093,7 +1108,12 @@ def handle(msg):
                 if len(parts)<2: return
                 try: t = int(parts[1])
                 except ValueError: return
-                approve(t); tg_send(chat,f"✅ Approved {t}"); tg_send(t,"🎉 Approved! /start"); return
+                info = api_get_user(str(t)) or {}
+                approve(t, info.get("name",""), info.get("username",""), info.get("chat_id",t))
+                tg_send(chat,f"✅ Approved {t}")
+                try: tg_send(t,"🎉 Approved! /start")
+                except Exception: pass
+                return
             if text.startswith("/remove"):
                 parts = text.split()
                 if len(parts)<2: return
@@ -1116,8 +1136,9 @@ def handle(msg):
                 parts = text.split(maxsplit=1)
                 if len(parts)<2: return
                 sent = 0
-                for uid in all_users().keys():
-                    try: tg_send(int(uid),f"📢 {parts[1]}"); sent += 1
+                for u in all_users().values():
+                    if not u.get("active", True): continue
+                    try: tg_send(int(u["id"]),f"📢 {parts[1]}"); sent += 1
                     except Exception: pass
                     time.sleep(0.05)
                 tg_send(chat,f"✅ Sent {sent}"); return
@@ -1126,6 +1147,7 @@ def handle(msg):
         tg_send(chat,"Use /start to pick a market")
     except Exception as e:
         print(f"[!] Handler: {e}",flush=True)
+        traceback.print_exc()
 
 # ============================================================
 #   AUTO LOOP
@@ -1134,7 +1156,7 @@ def auto_loop():
     last = 0
     while True:
         try:
-            if AUTO_FLAG.exists():
+            if os.path.exists(AUTO_FLAG):
                 if time.time()-last >= SCAN_INTERVAL:
                     print(f"[*] Auto scan {datetime.now().strftime('%H:%M:%S')}")
                     s = scan_auto()
@@ -1146,7 +1168,8 @@ def auto_loop():
                             except Exception: pass
                         print(f"[+] {s['symbol']} {s['direction']} {s['confidence']}%")
                     else: print("[~] No high-quality signal")
-                    last = time.time(); AUTO_FLAG.write_text(str(int(last)))
+                    last = time.time()
+                    open(AUTO_FLAG,"w").write(str(int(last)))
             time.sleep(5)
         except Exception as e:
             print(f"[!] Auto: {e}"); time.sleep(10)
@@ -1156,18 +1179,26 @@ def auto_loop():
 # ============================================================
 def main():
     print("="*60)
-    print("  Quotex Signal Bot v26 — Yahoo + curl_cffi Only")
+    print("  Quotex Signal Bot v32 — v26 Logic + API")
     print(f"  Markets: {len(SYMBOLS)} | Min Conf: {MIN_CONFIDENCE}%")
+    print(f"  API: {API_URL}")
     print("="*60)
-    _ensure_users_file()
-    print(f"[+] Users: {USERS_FILE.resolve()}")
+
     if not HAS_CFFI:
-        print("[!] curl_cffi NOT installed!")
+        print("[!] curl_cffi NOT installed — Yahoo will block")
         print("[!] Run: pip install curl_cffi")
-        print("[!] Without it, Yahoo will block all requests (429)")
     else:
         print("[+] curl_cffi OK — Yahoo bypass active")
-    print("[*] Testing...")
+
+    print("[*] API test...", flush=True)
+    t = api_get("stats")
+    if t and t.get("ok"):
+        st = t.get("stats",{})
+        print(f"[+] API connected — users: {st.get('total',0)}")
+    else:
+        print(f"[!] API not reachable")
+
+    print("[*] Yahoo test...")
     ok = 0
     for s in SYMBOLS[:5]:
         c = fetch_candles(s,"1m",20)
